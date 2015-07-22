@@ -4,6 +4,7 @@ require "logstash/namespace"
 require "logstash/plugin_mixins/http_client"
 require "socket" # for Socket.gethostname
 require "manticore"
+require "securerandom"
 
 # Note. This plugin is a WIP! Things will change and break!
 #
@@ -43,6 +44,9 @@ require "manticore"
 
 class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
   include LogStash::PluginMixins::HttpClient
+
+  # We pass this group of data around a lot
+  RequestMeta = Struct.new(:name, :request_spec, :batch_uuid, :batch_started_at, :issued_at)
 
   config_name "http_poller"
 
@@ -131,64 +135,65 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
 
   private
   def run_once(queue)
-    @requests.each do |name, request|
-      request_async(queue, name, request)
+    batch_started_at = Time.now
+    @requests.each do |name, request_spec|
+      request_meta = RequestMeta.new(name, request_spec, SecureRandom.uuid, batch_started_at, Time.now)
+      request_async(queue, request_meta)
     end
 
     client.execute!
   end
 
   private
-  def request_async(queue, name, request)
-    @logger.debug? && @logger.debug("Fetching URL", :name => name, :url => request)
-    started = Time.now
+  def request_async(queue, request_meta)
+    @logger.debug? && @logger.debug("Fetching URL",
+                                    name => request_meta.name,
+                                    :url => request_meta.request)
 
-    method, *request_opts = request
+    method, *request_opts = request_meta.request_spec
     client.async.send(method, *request_opts).
-      on_success {|response| handle_success(queue, name, request, response, Time.now - started)}.
-      on_failure {|exception|
-      handle_failure(queue, name, request, exception, Time.now - started)
+      on_success {|response| handle_success(queue, request_meta, response)}.
+      on_failure {|exception| handle_failure(queue, request_meta, exception)
     }
   end
 
   private
-  def handle_success(queue, name, request, response, execution_time)
+  def handle_success(queue, request_meta, response)
     @codec.decode(response.body) do |decoded|
       event = @target ? LogStash::Event.new(@target => decoded.to_hash) : decoded
-      handle_decoded_event(queue, name, request, response, event, execution_time)
+      handle_decoded_event(queue, event, request_meta, response)
     end
   end
 
   private
-  def handle_decoded_event(queue, name, request, response, event, execution_time)
-    apply_metadata(event, name, request, response, execution_time)
+  def handle_decoded_event(queue, event, request_meta, response)
     queue << event
   rescue StandardError, java.lang.Exception => e
     @logger.error? && @logger.error("Error eventifying response!",
                                     :exception => e,
                                     :exception_message => e.message,
-                                    :name => name,
-                                    :url => request,
+                                    :name => request_meta.name,
+                                    :url => request_meta.request_spec,
                                     :response => response
     )
   end
 
   private
   # Beware, on old versions of manticore some uncommon failures are not handled
-  def handle_failure(queue, name, request, exception, execution_time)
+  def handle_failure(queue, request_meta, exception)
     event = LogStash::Event.new
-    apply_metadata(event, name, request)
+    apply_metadata(event, request_meta)
 
     event.tag("_http_request_failure")
 
     # This is also in the metadata, but we send it anyone because we want this
     # persisted by default, whereas metadata isn't. People don't like mysterious errors
     event["_http_request_failure"] = {
-      "url" => @urls[name], # We want the exact parameter they passed in
-      "name" => name,
+      "url" => @urls[request_meta.name], # We want the exact parameter they passed in
+      "name" => request_meta.name,
       "error" => exception.to_s,
       "backtrace" => exception.backtrace,
-      "runtime_seconds" => execution_time
+      "runtime_seconds" => (Time.now - request_meta.issued_at)
    }
 
     queue << event
@@ -197,26 +202,27 @@ class LogStash::Inputs::HTTP_Poller < LogStash::Inputs::Base
                                       :exception => e,
                                       :exception_message => e.message,
                                       :exception_backtrace => e.backtrace,
-                                      :name => name,
+                                      :name => request_meta.name,
                                       :url => request
       )
   end
 
   private
-  def apply_metadata(event, name, request, response=nil, execution_time=nil)
+  def apply_metadata(event, request_meta, response=nil)
     return unless @metadata_target
-    event[@metadata_target] = event_metadata(name, request, response, execution_time)
+    event[@metadata_target] = event_metadata(request_meta, response)
   end
 
   private
-  def event_metadata(name, request, response=nil, execution_time=nil)
+  def event_metadata(request_meta, response=nil)
     m = {
-        "name" => name,
+        "name" => request_meta.name,
         "host" => @host,
-        "url" => @urls[name]
+        "url" => @urls[request_meta.name],
+        "issued_at" => request_meta.issued_at
       }
 
-    m["runtime_seconds"] = execution_time
+    m["runtime_seconds"] = Time.now - request_meta.issued_at
 
     if response
       m["code"] = response.code
